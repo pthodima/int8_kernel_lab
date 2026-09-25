@@ -1,4 +1,5 @@
 #include "generic_implicit_gemm.cuh"
+#include "spatial_halo.cuh"
 #include "spatial_strip.cuh"
 
 #include <cuda_runtime.h>
@@ -9,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -65,24 +67,120 @@ int32_t reference_value(const std::vector<int8_t> &input,
   return sum;
 }
 
+size_t greatest_common_divisor(size_t a, size_t b) {
+  while (b != 0) {
+    const size_t next = a % b;
+    a = b;
+    b = next;
+  }
+  return a;
+}
+
+// A stride that shares a factor with output_elements walks a proper subgroup.
+// Because output_elements == gemm_m * k, any stride divisible by k pins every
+// sample to output channel 0 -- which is what the old sample * n / count walk
+// did, hiding an entire class of epilogue bugs.  A stride coprime to
+// output_elements has full period, so consecutive samples advance through
+// every output channel and every ox.
+size_t full_period_stride(size_t elements) {
+  // Coprimality alone is not enough: a stride near elements/3 is coprime but
+  // still lands on a handful of output rows, because the quotient it advances
+  // the row index by stays nearly constant.  Scaling by 1/phi is the standard
+  // low-discrepancy choice and reaches every channel, ox and oy on all the
+  // shapes in workloads.csv.
+  size_t stride = static_cast<size_t>(static_cast<double>(elements) * 0.6180339887498949);
+  stride |= 1;
+  while (greatest_common_divisor(stride, elements) != 1) stride += 2;
+  return stride;
+}
+
+// Indices that a uniform walk is unlikely to land on but that kernels are
+// likely to get wrong: the padded border, the first and last pixel of an
+// output row (the spatial-strip and halo tap slide), and the output-channel
+// tail (the odd-K epilogue).
+template <class Shape>
+void append_directed_indices(std::vector<size_t> &indices) {
+  const int ys[] = {0, 1, Shape::out_h / 2, Shape::out_h - 2, Shape::out_h - 1};
+  const int xs[] = {0, 1, 2, Shape::out_w / 2, Shape::out_w - 3, Shape::out_w - 2,
+                    Shape::out_w - 1};
+  const int ks[] = {0, 1, Shape::k / 2, Shape::k - 2, Shape::k - 1};
+  const int ns[] = {0, Shape::n - 1};
+  for (int batch : ns) {
+    for (int y : ys) {
+      for (int x : xs) {
+        for (int channel : ks) {
+          if (batch < 0 || y < 0 || x < 0 || channel < 0) continue;
+          if (y >= Shape::out_h || x >= Shape::out_w || channel >= Shape::k) continue;
+          indices.push_back(
+              ((static_cast<size_t>(batch) * Shape::out_h + y) * Shape::out_w + x) *
+                  Shape::k +
+              channel);
+        }
+      }
+    }
+  }
+}
+
 template <class Shape>
 bool validate(const std::vector<int8_t> &input, const std::vector<int8_t> &filter,
               const std::vector<int32_t> &bias,
-              const std::vector<int32_t> &output, const char *label) {
-  const size_t samples =
-      Shape::output_elements <= 65536 ? Shape::output_elements : 2048;
-  for (size_t sample = 0; sample < samples; ++sample) {
-    const size_t index =
-        samples == Shape::output_elements ? sample
-                                          : sample * Shape::output_elements / samples;
+              const std::vector<int32_t> &output, const char *label,
+              size_t requested_samples = 4096) {
+  std::vector<size_t> indices;
+  if (Shape::output_elements <= 65536) {
+    indices.resize(Shape::output_elements);
+    for (size_t i = 0; i < Shape::output_elements; ++i) indices[i] = i;
+  } else {
+    const size_t stride = full_period_stride(Shape::output_elements);
+    indices.reserve(requested_samples + 512);
+    size_t index = 0;
+    for (size_t sample = 0; sample < requested_samples; ++sample) {
+      indices.push_back(index);
+      index += stride;
+      if (index >= Shape::output_elements) index -= Shape::output_elements;
+    }
+    append_directed_indices<Shape>(indices);
+  }
+  for (size_t index : indices) {
     const int32_t expected = reference_value<Shape>(input, filter, bias, index);
     if (output[index] != expected) {
-      std::cerr << label << " mismatch at output " << index << ": expected "
-                << expected << ", got " << output[index] << '\n';
+      const size_t m = index / Shape::k;
+      std::cerr << label << " mismatch at output " << index << " (n="
+                << m / (Shape::out_h * Shape::out_w) << " oy="
+                << (m / Shape::out_w) % Shape::out_h << " ox=" << m % Shape::out_w
+                << " k=" << index % Shape::k << "): expected " << expected
+                << ", got " << output[index] << '\n';
       return false;
     }
   }
   return true;
+}
+
+// Reports what the sampler actually reached, so a future change to the walk
+// cannot silently narrow coverage again.
+template <class Shape>
+void report_coverage(std::ostream &stream) {
+  if (Shape::output_elements <= 65536) {
+    stream << "coverage: exhaustive (" << Shape::output_elements << " outputs)\n";
+    return;
+  }
+  const size_t stride = full_period_stride(Shape::output_elements);
+  size_t index = 0;
+  std::vector<char> channels(Shape::k, 0), xs(Shape::out_w, 0), ys(Shape::out_h, 0);
+  for (size_t sample = 0; sample < 4096; ++sample) {
+    const size_t m = index / Shape::k;
+    channels[index % Shape::k] = 1;
+    xs[m % Shape::out_w] = 1;
+    ys[(m / Shape::out_w) % Shape::out_h] = 1;
+    index += stride;
+    if (index >= Shape::output_elements) index -= Shape::output_elements;
+  }
+  auto count = [](const std::vector<char> &v) {
+    return std::count(v.begin(), v.end(), 1);
+  };
+  stream << "coverage: " << count(channels) << "/" << Shape::k << " channels, "
+         << count(xs) << "/" << Shape::out_w << " ox, " << count(ys) << "/"
+         << Shape::out_h << " oy\n";
 }
 
 template <class Function>
@@ -110,8 +208,10 @@ float measure(Function launch, int warmup, int iterations) {
 }
 
 struct Options {
+  // "both" keeps its name for compatibility but now means "every candidate".
   std::string strategy = "both";
   bool csv = false;
+  bool coverage = false;
   int warmup = 20;
   int iterations = 101;
 };
@@ -122,6 +222,8 @@ Options parse_options(int argc, char **argv) {
     const std::string arg = argv[i];
     if (arg == "--csv") {
       options.csv = true;
+    } else if (arg == "--coverage") {
+      options.coverage = true;
     } else if ((arg == "--strategy" || arg == "--warmup" ||
                 arg == "--iterations") &&
                i + 1 < argc) {
@@ -130,12 +232,13 @@ Options parse_options(int argc, char **argv) {
       if (arg == "--warmup") options.warmup = std::stoi(value);
       if (arg == "--iterations") options.iterations = std::stoi(value);
     } else {
-      std::cerr << "usage: conv_lab [--strategy generic|strip|both] [--csv] "
-                   "[--warmup N] [--iterations N]\n";
+      std::cerr << "usage: conv_lab [--strategy generic|strip|halo|both] "
+                   "[--csv] [--coverage] [--warmup N] [--iterations N]\n";
       std::exit(EXIT_FAILURE);
     }
   }
   if ((options.strategy != "generic" && options.strategy != "strip" &&
+       options.strategy != "halo" && options.strategy != "splitk" &&
        options.strategy != "both") ||
       options.warmup < 0 || options.iterations <= 0) {
     std::cerr << "invalid benchmark options\n";
@@ -176,69 +279,138 @@ int run(const Options &options) {
                           d_output.get());
 #endif
   };
-  const bool strip_eligible = kSpatialStripEligible<Shape>;
-  float generic_ms = -1.0f;
-  float strip_ms = -1.0f;
-  bool generic_correct = true;
-  bool strip_correct = true;
-  std::vector<int32_t> output(Shape::output_elements);
 
-  if (options.strategy != "strip") {
-    generic();
-    check(cudaGetLastError(), "generic launch");
-    check(cudaDeviceSynchronize(), "generic synchronize");
+  std::vector<int32_t> output(Shape::output_elements);
+  // Run a candidate once, check it against the CPU oracle, and time it only if
+  // it was correct, so a broken kernel can never win a dispatch comparison.
+  auto evaluate = [&](auto launch, const char *label, float &milliseconds,
+                      bool &correct) {
+    launch();
+    check(cudaGetLastError(), label);
+    check(cudaDeviceSynchronize(), label);
     check(cudaMemcpy(output.data(), d_output.get(),
                      output.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
-          "copy generic output");
-    generic_correct = validate<Shape>(input, filter, bias, output, "generic");
-    if (generic_correct) generic_ms = measure(generic, options.warmup, options.iterations);
-  }
+          label);
+    correct = validate<Shape>(input, filter, bias, output, label);
+    if (correct) milliseconds = measure(launch, options.warmup, options.iterations);
+  };
 
+  const bool strip_eligible = kSpatialStripEligible<Shape>;
+  const bool halo_eligible = kSpatialHaloEligible<Shape>;
+  // Split-K needs at least two channel groups to divide between CTAs.
+  const bool splitk_eligible =
+      halo_eligible && kSplitKUsable<Shape, DefaultHaloTile, 2>;
+  float generic_ms = -1.0f, strip_ms = -1.0f, halo_ms = -1.0f;
+  bool generic_correct = true, strip_correct = true, halo_correct = true;
+
+  if (options.strategy == "generic" || options.strategy == "both") {
+    evaluate(generic, "generic", generic_ms, generic_correct);
+  }
   if constexpr (kSpatialStripEligible<Shape>) {
-    if (options.strategy != "generic") {
-      auto strip = [&] {
-        launch_spatial_strip<Shape>(d_input.get(), d_filter.get(), d_bias.get(),
-                                    d_output.get());
-      };
-      strip();
-      check(cudaGetLastError(), "spatial-strip launch");
-      check(cudaDeviceSynchronize(), "spatial-strip synchronize");
-      check(cudaMemcpy(output.data(), d_output.get(),
-                       output.size() * sizeof(int32_t), cudaMemcpyDeviceToHost),
-            "copy spatial-strip output");
-      strip_correct =
-          validate<Shape>(input, filter, bias, output, "spatial-strip");
-      if (strip_correct) {
-        strip_ms = measure(strip, options.warmup, options.iterations);
-      }
+    if (options.strategy == "strip" || options.strategy == "both") {
+      evaluate([&] {
+        launch_spatial_strip<Shape>(d_input.get(), d_filter.get(),
+                                    d_bias.get(), d_output.get());
+      }, "spatial-strip", strip_ms, strip_correct);
+    }
+  }
+  if constexpr (kSpatialHaloEligible<Shape>) {
+    if (options.strategy == "halo" || options.strategy == "both") {
+      evaluate([&] {
+        launch_spatial_halo<Shape>(d_input.get(), d_filter.get(), d_bias.get(),
+                                   d_output.get());
+      }, "spatial-halo", halo_ms, halo_correct);
     }
   }
 
+  // Split-K is a separate candidate rather than a mode of the halo, because it
+  // trades a zeroing pass plus atomics for CTA count: a dispatch policy has to
+  // be able to see both numbers and the split count that produced the better
+  // one.
+  float halo_splitk_ms = -1.0f;
+  int halo_splitk_splits = 0;
+  bool halo_splitk_correct = true;
+  auto try_splits = [&](auto tag) {
+    constexpr int kSplits = decltype(tag)::value;
+    if constexpr (kSpatialHaloEligible<Shape> &&
+                  kSplitKUsable<Shape, DefaultHaloTile, kSplits>) {
+      if (options.strategy == "halo" || options.strategy == "splitk" ||
+          options.strategy == "both") {
+        float ms = -1.0f;
+        bool ok = true;
+        evaluate([&] {
+          launch_spatial_halo<Shape, DefaultHaloTile, kSplits>(
+              d_input.get(), d_filter.get(), d_bias.get(), d_output.get());
+        }, "spatial-halo-splitk", ms, ok);
+        if (!ok) halo_splitk_correct = false;
+        if (ms >= 0 && (halo_splitk_ms < 0 || ms < halo_splitk_ms)) {
+          halo_splitk_ms = ms;
+          halo_splitk_splits = kSplits;
+        }
+      }
+    }
+  };
+  try_splits(std::integral_constant<int, 2>{});
+  try_splits(std::integral_constant<int, 4>{});
+  try_splits(std::integral_constant<int, 8>{});
+  try_splits(std::integral_constant<int, 16>{});
+
   const char *winner = "none";
-  if (generic_ms >= 0 && strip_ms >= 0) winner = strip_ms < generic_ms ? "strip" : "generic";
-  else if (generic_ms >= 0) winner = "generic";
-  else if (strip_ms >= 0) winner = "strip";
+  float best = -1.0f;
+  if (generic_ms >= 0) { winner = "generic"; best = generic_ms; }
+  if (strip_ms >= 0 && (best < 0 || strip_ms < best)) { winner = "strip"; best = strip_ms; }
+  if (halo_ms >= 0 && (best < 0 || halo_ms < best)) { winner = "halo"; best = halo_ms; }
+  if (halo_splitk_ms >= 0 && (best < 0 || halo_splitk_ms < best)) {
+    winner = "halo_splitk"; best = halo_splitk_ms;
+  }
+
+  if (options.coverage) report_coverage<Shape>(std::cerr);
 
   if (options.csv) {
-    std::cout << "case,n,h,w,c,k,r,s,out_h,out_w,eligible_strip,generic_ms,"
-                 "strip_ms,winner,generic_correct,strip_correct\n";
-    std::cout << kCaseName << ',' << Shape::n << ',' << Shape::h << ',' << Shape::w
-              << ',' << Shape::c << ',' << Shape::k << ',' << Shape::r << ','
-              << Shape::s << ',' << Shape::out_h << ',' << Shape::out_w << ','
-              << (strip_eligible ? 1 : 0) << ',' << generic_ms << ',' << strip_ms
-              << ',' << winner << ',' << (generic_correct ? 1 : 0) << ','
-              << (strip_correct ? 1 : 0) << '\n';
+    std::cout << "case,n,h,w,c,k,r,s,pad_h,pad_w,stride_h,stride_w,dilation_h,"
+                 "dilation_w,out_h,out_w,gemm_m,gemm_n,gemm_k,eligible_strip,"
+                 "eligible_halo,eligible_splitk,generic_ms,strip_ms,halo_ms,halo_splitk_ms,"
+                 "halo_splits,winner,best_ms,generic_correct,strip_correct,"
+                 "halo_correct,halo_splitk_correct\n";
+    std::cout << kCaseName << ',' << Shape::n << ',' << Shape::h << ','
+              << Shape::w << ',' << Shape::c << ',' << Shape::k << ','
+              << Shape::r << ',' << Shape::s << ',' << Shape::pad_h << ','
+              << Shape::pad_w << ',' << Shape::stride_h << ','
+              << Shape::stride_w << ',' << Shape::dilation_h << ','
+              << Shape::dilation_w << ',' << Shape::out_h << ','
+              << Shape::out_w << ',' << Shape::gemm_m << ',' << Shape::gemm_n
+              << ',' << Shape::gemm_k << ',' << (strip_eligible ? 1 : 0) << ','
+              << (halo_eligible ? 1 : 0) << ',' << (splitk_eligible ? 1 : 0)
+              << ',' << generic_ms << ','
+              << strip_ms << ',' << halo_ms << ',' << halo_splitk_ms << ','
+              << halo_splitk_splits << ',' << winner << ',' << best << ','
+              << (generic_correct ? 1 : 0) << ',' << (strip_correct ? 1 : 0)
+              << ',' << (halo_correct ? 1 : 0) << ','
+              << (halo_splitk_correct ? 1 : 0) << '\n';
   } else {
-    std::cout << kCaseName << ": generic ";
-    if (generic_ms >= 0) std::cout << std::fixed << std::setprecision(4) << generic_ms << " ms";
-    else std::cout << "not run";
-    std::cout << ", spatial strip ";
-    if (!strip_eligible) std::cout << "ineligible";
-    else if (strip_ms >= 0) std::cout << std::fixed << std::setprecision(4) << strip_ms << " ms";
-    else std::cout << "failed";
-    std::cout << ", winner " << winner << '\n';
+    auto show = [&](const char *label, bool eligible, float milliseconds) {
+      std::cout << label << ' ';
+      if (!eligible) std::cout << "ineligible";
+      else if (milliseconds >= 0)
+        std::cout << std::fixed << std::setprecision(4) << milliseconds << " ms";
+      else std::cout << "not run";
+      std::cout << ", ";
+    };
+    std::cout << kCaseName << ": ";
+    show("generic", true, generic_ms);
+    show("strip", strip_eligible, strip_ms);
+    show("halo", halo_eligible, halo_ms);
+    std::cout << "splitk";
+    if (halo_splitk_ms >= 0)
+      std::cout << "x" << halo_splitk_splits << ' ' << std::fixed
+                << std::setprecision(4) << halo_splitk_ms << " ms, ";
+    else std::cout << " ineligible, ";
+    std::cout << "winner " << winner << '\n';
   }
-  return generic_correct && strip_correct && std::string(winner) != "none" ? 0 : 1;
+  return generic_correct && strip_correct && halo_correct &&
+                 halo_splitk_correct && std::string(winner) != "none"
+             ? 0
+             : 1;
 }
 
 }  // namespace

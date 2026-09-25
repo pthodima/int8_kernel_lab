@@ -4,19 +4,19 @@ MMA ?= auto
 CASE ?= smoke
 CONFIG ?= workloads.csv
 WITH_CUDNN ?= 0
-CUDNN_ROOT ?= /opt/cudnn-linux-x86_64-9.25.0.15_cuda13-archive
+CUDNN_ROOT ?= /usr
 
 BUILD := build
 BIN := $(BUILD)/conv_lab
 CUDNN_BIN := $(BUILD)/cudnn_lab
 CASE_HEADER := $(BUILD)/case_config.cuh
 HEADERS := $(wildcard include/*.cuh)
+# Compare the compute capability numerically.  A prefix match on sm_8%/sm_9%
+# silently missed sm_10x and sm_12x and picked the m8n8k16 path on Blackwell,
+# which is both ~3x slower and ranks the dispatch candidates differently.
+ARCH_NUM := $(shell echo '$(ARCH)' | sed 's/[^0-9]//g')
 ifeq ($(MMA),auto)
-ifneq ($(filter sm_8% sm_9%,$(ARCH)),)
-MMA := sm80
-else
-MMA := sm75
-endif
+MMA := $(shell test '$(ARCH_NUM)' -ge 80 2>/dev/null && echo sm80 || echo sm75)
 endif
 
 ifeq ($(MMA),sm80)

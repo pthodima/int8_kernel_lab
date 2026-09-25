@@ -142,11 +142,14 @@ __global__ __launch_bounds__(Tile::threads, 1) void generic_implicit_gemm_kernel
     for (int n = 0; n < 2; ++n) {
       const int row = tile_m + m * 8 + lane / 4;
       const int col = warp_n + n * 8 + (lane & 3) * 2;
-      if (row < Shape::gemm_m && col < Shape::gemm_n) {
-        output[row * Shape::gemm_n + col] = accum[m][n][0] + bias[col];
-      }
-      if (row < Shape::gemm_m && col + 1 < Shape::gemm_n) {
-        output[row * Shape::gemm_n + col + 1] = accum[m][n][1] + bias[col + 1];
+      if (row < Shape::gemm_m) {
+        if (col + 1 < Shape::gemm_n) {
+          store_bias_pair<Shape::gemm_n>(output, bias, row, col, accum[m][n][0],
+                                         accum[m][n][1]);
+        } else if (col < Shape::gemm_n) {
+          output[static_cast<size_t>(row) * Shape::gemm_n + col] =
+              accum[m][n][0] + bias[col];
+        }
       }
     }
   }
@@ -215,13 +218,25 @@ __global__ __launch_bounds__(Tile::threads, 1) void generic_implicit_gemm_sm80_k
     for (int n = 0; n < 2; ++n) {
       const int row = tile_m + m * 16 + lane / 4;
       const int col = warp_n + n * 8 + (lane & 3) * 2;
-      if (row < Shape::gemm_m && col + 1 < Shape::gemm_n) {
-        output[row * Shape::gemm_n + col] = accum[m][n][0] + bias[col];
-        output[row * Shape::gemm_n + col + 1] = accum[m][n][1] + bias[col + 1];
+      // The paired column store is kept adjacent on the fast path so ptxas can
+      // still fuse it into one 64-bit store; an odd gemm_n takes the tail.
+      if (row < Shape::gemm_m) {
+        if (col + 1 < Shape::gemm_n) {
+          store_bias_pair<Shape::gemm_n>(output, bias, row, col, accum[m][n][0],
+                                         accum[m][n][1]);
+        } else if (col < Shape::gemm_n) {
+          output[static_cast<size_t>(row) * Shape::gemm_n + col] =
+              accum[m][n][0] + bias[col];
+        }
       }
-      if (row + 8 < Shape::gemm_m && col + 1 < Shape::gemm_n) {
-        output[(row + 8) * Shape::gemm_n + col] = accum[m][n][2] + bias[col];
-        output[(row + 8) * Shape::gemm_n + col + 1] = accum[m][n][3] + bias[col + 1];
+      if (row + 8 < Shape::gemm_m) {
+        if (col + 1 < Shape::gemm_n) {
+          store_bias_pair<Shape::gemm_n>(output, bias, row + 8, col,
+                                         accum[m][n][2], accum[m][n][3]);
+        } else if (col < Shape::gemm_n) {
+          output[static_cast<size_t>(row + 8) * Shape::gemm_n + col] =
+              accum[m][n][2] + bias[col];
+        }
       }
     }
 }

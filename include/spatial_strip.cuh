@@ -116,7 +116,7 @@ __device__ __forceinline__ void strip_load_fragments(
 }
 
 template <class Shape>
-__global__ __launch_bounds__(128, 1) void spatial_strip_kernel(
+__global__ __launch_bounds__(128, INT8_LAB_MIN_CTAS_PER_SM) void spatial_strip_kernel(
     const int8_t *__restrict__ input, const int8_t *__restrict__ filter,
     const int32_t *__restrict__ bias, int32_t *__restrict__ output) {
   using L = SpatialStripLayout<Shape>;
@@ -187,10 +187,9 @@ __global__ __launch_bounds__(128, 1) void spatial_strip_kernel(
     for (int mma_n = 0; mma_n < 4; ++mma_n) {
       const int row = block_m + warp_m_group + lane / 4 + mma_m * 16;
       const int col = n_base + warp_n_group + (lane & 3) * 2 + mma_n * 16;
-      output[row * Shape::gemm_n + col] =
-          accumulators[mma_m][mma_n][0] + bias[col];
-      output[row * Shape::gemm_n + col + 1] =
-          accumulators[mma_m][mma_n][1] + bias[col + 1];
+      store_bias_pair<Shape::gemm_n>(output, bias, row, col,
+                                     accumulators[mma_m][mma_n][0],
+                                     accumulators[mma_m][mma_n][1]);
     }
   }
 }
@@ -212,7 +211,7 @@ void launch_spatial_strip_sm75(const int8_t *input, const int8_t *filter,
 // registers.  The lane/K mapping is intentionally identical to
 // TensorCoreMMAInstruction::getFrag{A,B,C}ElementSubscript.
 template <class Shape>
-__global__ __launch_bounds__(128, 1) void spatial_strip_sm80_kernel(
+__global__ __launch_bounds__(128, INT8_LAB_MIN_CTAS_PER_SM) void spatial_strip_sm80_kernel(
     const int8_t *__restrict__ input, const int8_t *__restrict__ filter,
     const int32_t *__restrict__ bias, int32_t *__restrict__ output) {
   using L = SpatialStripLayout<Shape>;
@@ -278,10 +277,10 @@ __global__ __launch_bounds__(128, 1) void spatial_strip_sm80_kernel(
     for (int n = 0; n < 4; ++n) {
       const int row = block_m + warp_m + m * 16 + lane / 4;
       const int col = n_base + warp_n + n * 8 + (lane & 3) * 2;
-      output[row * Shape::gemm_n + col] = acc[m][n][0] + bias[col];
-      output[row * Shape::gemm_n + col + 1] = acc[m][n][1] + bias[col + 1];
-      output[(row + 8) * Shape::gemm_n + col] = acc[m][n][2] + bias[col];
-      output[(row + 8) * Shape::gemm_n + col + 1] = acc[m][n][3] + bias[col + 1];
+      store_bias_pair<Shape::gemm_n>(output, bias, row, col, acc[m][n][0],
+                                     acc[m][n][1]);
+      store_bias_pair<Shape::gemm_n>(output, bias, row + 8, col, acc[m][n][2],
+                                     acc[m][n][3]);
     }
 }
 #endif

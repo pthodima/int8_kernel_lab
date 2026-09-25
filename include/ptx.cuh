@@ -2,6 +2,21 @@
 
 #include <cstdint>
 
+// Minimum CTAs per SM requested from ptxas.  Both spatial kernels carry 64
+// INT32 accumulators per thread and default to ~1.5x the register budget that
+// four concurrent CTAs allow, so without this they run at one third of the
+// occupancy they could.  Measured on sm_120/big_3x3_s1: strip 9.34 -> 8.52 ms,
+// halo 10.10 -> 7.41 ms.  Five spills and costs roughly 2x, so this is a
+// per-architecture tuning knob, not a constant of nature.
+// m8n8k16 needs one more register per accumulator pair and spills at four.
+#ifndef INT8_LAB_MIN_CTAS_PER_SM
+#if INT8_LAB_MMA_SM80
+#define INT8_LAB_MIN_CTAS_PER_SM 4
+#else
+#define INT8_LAB_MIN_CTAS_PER_SM 3
+#endif
+#endif
+
 __device__ __forceinline__ void load_matrix_x2(const void *source,
                                                 uint32_t &r0, uint32_t &r1) {
   uint32_t address = static_cast<uint32_t>(__cvta_generic_to_shared(source));
@@ -41,4 +56,25 @@ __device__ __forceinline__ void mma_m16n8k32(
   d1 = next1;
   d2 = next2;
   d3 = next3;
+}
+
+// The INT8 MMA C fragments hand each lane two adjacent output columns, but
+// ptxas does not fuse the two scalar stores on its own -- it emits 2x STG.E,
+// which touches 32 bytes of sectors per 16 useful bytes (2x write
+// amplification).  Emitting the pair explicitly gives STG.E.64.  `col` is
+// always even by construction; an odd row pitch would break the 8-byte
+// alignment, so that case keeps the scalar stores.
+template <int Pitch>
+__device__ __forceinline__ void store_bias_pair(int32_t *__restrict__ output,
+                                                const int32_t *__restrict__ bias,
+                                                int row, int col, int32_t v0,
+                                                int32_t v1) {
+  int32_t *destination = output + static_cast<size_t>(row) * Pitch + col;
+  if constexpr (Pitch % 2 == 0) {
+    *reinterpret_cast<int2 *>(destination) =
+        make_int2(v0 + bias[col], v1 + bias[col + 1]);
+  } else {
+    destination[0] = v0 + bias[col];
+    destination[1] = v1 + bias[col + 1];
+  }
 }

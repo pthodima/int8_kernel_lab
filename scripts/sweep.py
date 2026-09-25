@@ -41,19 +41,27 @@ def main() -> None:
              str(args.iterations), "--csv"],
             cwd=root, check=True, text=True, capture_output=True)
         measurement = next(csv.DictReader(result.stdout.splitlines()))
-        if args.with_cudnn and int(next(r for r in rows if r["name"] == case)["c"]) % 32 == 0 and int(next(r for r in rows if r["name"] == case)["k"]) % 32 == 0:
+        if args.with_cudnn:
+            # The graph harness decides its own eligibility: it reports zero
+            # engine configurations for a shape or contract cuDNN cannot serve,
+            # so there is no divisor gate to keep in sync here.
             cudnn = subprocess.run(["./build/cudnn_lab"], cwd=root, check=True,
                                    text=True, capture_output=True)
             cudnn_row = next(csv.DictReader(cudnn.stdout.splitlines()))
-            dispatch_ms = float(measurement["strip_ms"] if measurement["winner"] == "strip" else measurement["generic_ms"])
-            cudnn_ms = float(cudnn_row["cudnn_ms"])
+            dispatch_ms = float(measurement["best_ms"])
             measurement["dispatch_ms"] = dispatch_ms
-            measurement["cudnn_ms"] = cudnn_ms
-            measurement["cudnn_over_dispatch"] = cudnn_ms / dispatch_ms
-            measurement["comparison_contract"] = "dispatch:int32_vs_cudnn:int8x32"
-        elif args.with_cudnn:
-            measurement.update(dispatch_ms="", cudnn_ms="", cudnn_over_dispatch="",
-                               comparison_contract="cudnn_int8x32_ineligible")
+            for label in ("f32", "int8"):
+                ms = float(cudnn_row[f"cudnn_{label}_ms"])
+                ok = cudnn_row[f"cudnn_{label}_validated"] == "1"
+                measurement[f"cudnn_{label}_ms"] = ms if ok else ""
+                measurement[f"cudnn_{label}_over_dispatch"] = (
+                    ms / dispatch_ms if ok and dispatch_ms > 0 else "")
+            # f32 matches the lab's four output bytes per element, so it is the
+            # like-for-like number; int8 writes one byte and measures what the
+            # INT32 contract costs rather than kernel quality.
+            measurement["comparison_contract"] = (
+                "lab:int32_vs_cudnn:f32(like-for-like),int8(requantized)")
+            measurement["cudnn_note"] = cudnn_row["cudnn_note"]
         measurements.append(measurement)
         with output.open("w", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=measurements[0].keys())
