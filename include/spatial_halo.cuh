@@ -17,13 +17,18 @@
 //
 // For 3x3/stride1 with a 4x32 patch that is 6x34 = 204 staged pixels per 128
 // outputs per 9 taps, against the strip's 3 * 130 = 390.
-template <int TileH, int TileW>
+template <int TileH, int TileW, int StageK = 64>
 struct HaloTile {
   static constexpr int tile_h = TileH;
   static constexpr int tile_w = TileW;
   static constexpr int cta_m = TileH * TileW;
   static constexpr int cta_n = 64;
-  static constexpr int stage_k = 64;
+  // Channels staged per pass.  Halving this halves the staged slab, which is
+  // what binds occupancy once the halo grows: at stride 2 a 4x32 patch needs
+  // 9x65 pixels and 41 KB at StageK=64, holding the kernel to 2 CTAs/SM.
+  static constexpr int stage_k = StageK;
+  static_assert(StageK == 32 || StageK == 64 || StageK == 128,
+                "stage_k must be 32, 64 or 128");
   static constexpr int threads = 128;
   static_assert(cta_m == 128, "fragment and epilogue mapping assume 128 rows");
   static_assert(TileW % 16 == 0,
@@ -39,7 +44,11 @@ struct HaloTile {
 #ifndef INT8_LAB_HALO_TILE_W
 #define INT8_LAB_HALO_TILE_W 32
 #endif
-using DefaultHaloTile = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W>;
+#ifndef INT8_LAB_HALO_STAGE_K
+#define INT8_LAB_HALO_STAGE_K 64
+#endif
+using DefaultHaloTile =
+    HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, INT8_LAB_HALO_STAGE_K>;
 
 template <class Shape, class Tile = DefaultHaloTile>
 struct HaloLayout {
@@ -81,8 +90,19 @@ inline constexpr bool kSpatialHaloEligible =
 // Same XOR swizzle the strip uses: with 64-byte rows it makes any run of eight
 // consecutive rows land on eight disjoint bank quads, so ldmatrix is
 // conflict-free regardless of the row the tap slide starts on.
+// An ldmatrix fragment reads eight rows of sixteen bytes.  Their bank quads
+// are (row * vectors + vector) mod 8, so the rotation applied to `vector` has
+// to change every 8 / vectors rows to make all eight distinct.  At StageK=64
+// that is every other row; at StageK=32, where a row holds only two vectors,
+// every fourth.
+template <int StageK>
 __device__ __forceinline__ int halo_swizzle(int byte_offset) {
-  return byte_offset ^ ((byte_offset & 0x1c0) >> 2);
+  constexpr int kVectors = StageK / 16;
+  constexpr int kShift = kVectors == 8 ? 0 : (kVectors == 4 ? 1 : 2);
+  const int row = byte_offset / StageK;
+  const int vector = (byte_offset / 16) % kVectors;
+  const int rotated = vector ^ ((row >> kShift) & (kVectors - 1));
+  return row * StageK + rotated * 16 + (byte_offset & 15);
 }
 
 template <class Shape, class Tile>
@@ -105,7 +125,7 @@ __device__ __forceinline__ void stage_halo_a(int8_t *shared_a,
       value = *reinterpret_cast<const int4 *>(
           input + ((batch * Shape::h + y) * Shape::w + x) * Shape::c + channel);
     }
-    *reinterpret_cast<int4 *>(shared_a + halo_swizzle(vector * 16)) = value;
+    *reinterpret_cast<int4 *>(shared_a + halo_swizzle<Tile::stage_k>(vector * 16)) = value;
   }
 }
 
@@ -141,7 +161,7 @@ __device__ __forceinline__ void store_halo_b(
 #pragma unroll
   for (int i = 0; i < L::b_vectors_per_thread; ++i) {
     const int vector = thread + i * Tile::threads;
-    *reinterpret_cast<int4 *>(shared_b + halo_swizzle(vector * 16)) =
+    *reinterpret_cast<int4 *>(shared_b + halo_swizzle<Tile::stage_k>(vector * 16)) =
         prefetch.values[i];
   }
 }
@@ -217,16 +237,16 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
           load_matrix_x4(
-              shared_a + halo_swizzle(halo_a_offset<Shape, Tile>(
+              shared_a + halo_swizzle<Tile::stage_k>(halo_a_offset<Shape, Tile>(
                              warp_m + m * 16 + lane % 16, filter_y, filter_x,
                              k + (lane / 16) * 16)),
               a[m][0], a[m][1], a[m][2], a[m][3]);
         }
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
-          load_matrix_x2(shared_b + halo_swizzle((warp_n + n * 8 + lane % 8) *
-                                                     Tile::stage_k +
-                                                 k + ((lane / 8) % 2) * 16),
+          load_matrix_x2(shared_b + halo_swizzle<Tile::stage_k>(
+                             (warp_n + n * 8 + lane % 8) * Tile::stage_k + k +
+                             ((lane / 8) % 2) * 16),
                          b[n][0], b[n][1]);
         }
 #pragma unroll
@@ -330,15 +350,14 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
         for (int group = 0; group < 2; ++group) {
           const int source_m8 = group * 4 + (lane >> 3);
           load_matrix_x4(
-              shared_a + halo_swizzle(halo_a_offset<Shape, Tile>(
+              shared_a + halo_swizzle<Tile::stage_k>(halo_a_offset<Shape, Tile>(
                              warp_m_group + (lane & 7) + source_m8 * 16,
                              filter_y, filter_x, k_step)),
               a[group * 4], a[group * 4 + 1], a[group * 4 + 2], a[group * 4 + 3]);
         }
-        load_matrix_x4(shared_b + halo_swizzle((warp_n_group + (lane & 7)) *
-                                                   Tile::stage_k +
-                                               (lane >> 3) * 16 * Tile::stage_k +
-                                               k_step),
+        load_matrix_x4(shared_b + halo_swizzle<Tile::stage_k>(
+                           (warp_n_group + (lane & 7)) * Tile::stage_k +
+                           (lane >> 3) * 16 * Tile::stage_k + k_step),
                        b[0], b[1], b[2], b[3]);
 #pragma unroll
         for (int mma_m = 0; mma_m < 8; ++mma_m)

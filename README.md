@@ -16,7 +16,14 @@ to measure a dispatch policy, not to replace a production convolution library.
 Three kernel families have the same input/output contract:
 
 - `generic`: staged implicit GEMM.  It covers all listed shapes with channel
-  counts divisible by 16.
+  counts divisible by 16.  Its tile is fixed at `64 x 64 x 32` with `64 x 16`
+  warp tiles: `GenericTile` templates only `StageK`, both launchers instantiate
+  the default, and the kernels hardcode their loop bounds and accumulator
+  extents rather than deriving them from `Tile::`, so the shape is not
+  expressible as a template argument today.  It is the fallback for every shape
+  the specialized candidates decline, and runs at roughly a third of machine
+  peak, so deriving those bounds and sweeping `(cta_m, cta_n, warp_n, stage_k)`
+  the way the halo sweeps `(stage_k, splits)` is the largest remaining lever.
 - `spatial_strip`: a `128 x 64 x 64` specialization.  It stages one
   horizontally contiguous `130 x 64` input strip and reuses it across the three
   filter columns of a 3x3, horizontal-stride-one convolution.
@@ -32,6 +39,13 @@ Three kernel families have the same input/output contract:
   less activation traffic than the strip and drops the strip's `out_w` divisor
   requirement -- output edges are predicated instead.  The patch aspect ratio
   is a compile-time knob (`INT8_LAB_HALO_TILE_H`/`_W`, default `4 x 32`).
+  Channels staged per pass (`stage_k`) is searched at run time over 64 and 32,
+  because it is not a global default: 64 wins when the patch is compact, but
+  stride or a large filter inflates the halo until the staged slab, not the
+  register file, binds occupancy.  A `4 x 32` patch at stride 2 needs 41 KB and
+  gets 2 CTAs/SM at 64, against 21 KB and 4 at 32 -- worth 1.55x on
+  `big_3x3_s2`, and it makes `big_5x5_s2` eligible at all, while costing 10% on
+  `big_3x3_s1`.
 
 Unsupported shapes are reported as ineligible, rather than silently using a
 different algorithm.
@@ -72,8 +86,11 @@ Use `--strategy generic`, `--strategy strip`, `--strategy halo`, or
 `--strategy splitk` to isolate a candidate; `--strategy both` runs every
 eligible one.  The CSV carries one eligibility flag and one timing column per
 candidate (`eligible_strip`, `eligible_halo`, `eligible_splitk`, `generic_ms`,
-`strip_ms`, `halo_ms`, `halo_splitk_ms`), plus `halo_splits` for the split
-count that produced `halo_splitk_ms`, and `winner`/`best_ms`.  `--coverage` prints what
+`strip_ms`, `halo_ms`, `halo_splitk_ms`), the configuration that produced each
+halo number (`halo_stage_k`, `halo_splits`, `halo_splitk_stage_k`), and
+`winner`/`best_ms`.  The halo and split-K candidates search ten configurations
+per shape -- two `stage_k` values by five split counts -- so a build covers the
+whole space and the CSV records which point won.  `--coverage` prints what
 fraction of output channels, `ox`, and `oy` the correctness sampler reaches.
 
 The oracle check is exhaustive below 65536 outputs.  Above that it walks a

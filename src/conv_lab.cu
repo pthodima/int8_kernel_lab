@@ -296,12 +296,26 @@ int run(const Options &options) {
   };
 
   const bool strip_eligible = kSpatialStripEligible<Shape>;
-  const bool halo_eligible = kSpatialHaloEligible<Shape>;
-  // Split-K needs at least two channel groups to divide between CTAs.
+  // The halo search space is (stage_k, splits).  stage_k is not a global
+  // default: 64 is best when the patch is compact, but stride or a large
+  // filter inflates the halo until the staged slab, not the register file,
+  // binds occupancy -- a 4x32 patch at stride 2 needs 41 KB and gets 2 CTAs/SM
+  // at stage_k 64 against 21 KB and 4 at 32.  Measured on big_3x3_s2, halving
+  // it is worth 1.55x; on big_3x3_s1 it costs 10%.  So both are candidates and
+  // the dispatch table records which one won.
+  using HaloTile64 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 64>;
+  using HaloTile32 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 32>;
+  const bool halo_eligible =
+      kSpatialHaloEligible<Shape, HaloTile64> || kSpatialHaloEligible<Shape, HaloTile32>;
   const bool splitk_eligible =
-      halo_eligible && kSplitKUsable<Shape, DefaultHaloTile, 2>;
+      (kSpatialHaloEligible<Shape, HaloTile64> && kSplitKUsable<Shape, HaloTile64, 2>) ||
+      (kSpatialHaloEligible<Shape, HaloTile32> && kSplitKUsable<Shape, HaloTile32, 2>);
   float generic_ms = -1.0f, strip_ms = -1.0f, halo_ms = -1.0f;
   bool generic_correct = true, strip_correct = true, halo_correct = true;
+  int halo_stage_k = 0;
+  float halo_splitk_ms = -1.0f;
+  int halo_splitk_splits = 0, halo_splitk_stage_k = 0;
+  bool halo_splitk_correct = true;
 
   if (options.strategy == "generic" || options.strategy == "both") {
     evaluate(generic, "generic", generic_ms, generic_correct);
@@ -314,46 +328,55 @@ int run(const Options &options) {
       }, "spatial-strip", strip_ms, strip_correct);
     }
   }
-  if constexpr (kSpatialHaloEligible<Shape>) {
-    if (options.strategy == "halo" || options.strategy == "both") {
-      evaluate([&] {
-        launch_spatial_halo<Shape>(d_input.get(), d_filter.get(), d_bias.get(),
-                                   d_output.get());
-      }, "spatial-halo", halo_ms, halo_correct);
-    }
-  }
 
-  // Split-K is a separate candidate rather than a mode of the halo, because it
-  // trades a zeroing pass plus atomics for CTA count: a dispatch policy has to
-  // be able to see both numbers and the split count that produced the better
-  // one.
-  float halo_splitk_ms = -1.0f;
-  int halo_splitk_splits = 0;
-  bool halo_splitk_correct = true;
-  auto try_splits = [&](auto tag) {
-    constexpr int kSplits = decltype(tag)::value;
-    if constexpr (kSpatialHaloEligible<Shape> &&
-                  kSplitKUsable<Shape, DefaultHaloTile, kSplits>) {
-      if (options.strategy == "halo" || options.strategy == "splitk" ||
-          options.strategy == "both") {
+  // Split-K stays a separate candidate rather than a mode of the halo, because
+  // it trades a zeroing pass plus atomics for CTA count: a dispatch policy has
+  // to see both numbers and the configuration that produced each.
+  auto try_halo = [&](auto stage_tag, auto split_tag) {
+    constexpr int kStageK = decltype(stage_tag)::value;
+    constexpr int kSplits = decltype(split_tag)::value;
+    using Tile = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, kStageK>;
+    if constexpr (kSpatialHaloEligible<Shape, Tile> &&
+                  kSplitKUsable<Shape, Tile, kSplits>) {
+      const bool wanted = kSplits == 1
+                              ? (options.strategy == "halo" ||
+                                 options.strategy == "both")
+                              : (options.strategy == "halo" ||
+                                 options.strategy == "splitk" ||
+                                 options.strategy == "both");
+      if (wanted) {
         float ms = -1.0f;
         bool ok = true;
         evaluate([&] {
-          launch_spatial_halo<Shape, DefaultHaloTile, kSplits>(
+          launch_spatial_halo<Shape, Tile, kSplits>(
               d_input.get(), d_filter.get(), d_bias.get(), d_output.get());
-        }, "spatial-halo-splitk", ms, ok);
-        if (!ok) halo_splitk_correct = false;
-        if (ms >= 0 && (halo_splitk_ms < 0 || ms < halo_splitk_ms)) {
-          halo_splitk_ms = ms;
-          halo_splitk_splits = kSplits;
+        }, kSplits == 1 ? "spatial-halo" : "spatial-halo-splitk", ms, ok);
+        if constexpr (kSplits == 1) {
+          if (!ok) halo_correct = false;
+          if (ms >= 0 && (halo_ms < 0 || ms < halo_ms)) {
+            halo_ms = ms;
+            halo_stage_k = kStageK;
+          }
+        } else {
+          if (!ok) halo_splitk_correct = false;
+          if (ms >= 0 && (halo_splitk_ms < 0 || ms < halo_splitk_ms)) {
+            halo_splitk_ms = ms;
+            halo_splitk_splits = kSplits;
+            halo_splitk_stage_k = kStageK;
+          }
         }
       }
     }
   };
-  try_splits(std::integral_constant<int, 2>{});
-  try_splits(std::integral_constant<int, 4>{});
-  try_splits(std::integral_constant<int, 8>{});
-  try_splits(std::integral_constant<int, 16>{});
+  auto try_stage = [&](auto stage_tag) {
+    try_halo(stage_tag, std::integral_constant<int, 1>{});
+    try_halo(stage_tag, std::integral_constant<int, 2>{});
+    try_halo(stage_tag, std::integral_constant<int, 4>{});
+    try_halo(stage_tag, std::integral_constant<int, 8>{});
+    try_halo(stage_tag, std::integral_constant<int, 16>{});
+  };
+  try_stage(std::integral_constant<int, 64>{});
+  try_stage(std::integral_constant<int, 32>{});
 
   const char *winner = "none";
   float best = -1.0f;
@@ -369,9 +392,10 @@ int run(const Options &options) {
   if (options.csv) {
     std::cout << "case,n,h,w,c,k,r,s,pad_h,pad_w,stride_h,stride_w,dilation_h,"
                  "dilation_w,out_h,out_w,gemm_m,gemm_n,gemm_k,eligible_strip,"
-                 "eligible_halo,eligible_splitk,generic_ms,strip_ms,halo_ms,halo_splitk_ms,"
-                 "halo_splits,winner,best_ms,generic_correct,strip_correct,"
-                 "halo_correct,halo_splitk_correct\n";
+                 "eligible_halo,eligible_splitk,generic_ms,strip_ms,halo_ms,"
+                 "halo_stage_k,halo_splitk_ms,halo_splits,halo_splitk_stage_k,"
+                 "winner,best_ms,generic_correct,strip_correct,halo_correct,"
+                 "halo_splitk_correct\n";
     std::cout << kCaseName << ',' << Shape::n << ',' << Shape::h << ','
               << Shape::w << ',' << Shape::c << ',' << Shape::k << ','
               << Shape::r << ',' << Shape::s << ',' << Shape::pad_h << ','
@@ -382,8 +406,9 @@ int run(const Options &options) {
               << ',' << Shape::gemm_k << ',' << (strip_eligible ? 1 : 0) << ','
               << (halo_eligible ? 1 : 0) << ',' << (splitk_eligible ? 1 : 0)
               << ',' << generic_ms << ','
-              << strip_ms << ',' << halo_ms << ',' << halo_splitk_ms << ','
-              << halo_splitk_splits << ',' << winner << ',' << best << ','
+              << strip_ms << ',' << halo_ms << ',' << halo_stage_k << ','
+              << halo_splitk_ms << ',' << halo_splitk_splits << ','
+              << halo_splitk_stage_k << ',' << winner << ',' << best << ','
               << (generic_correct ? 1 : 0) << ',' << (strip_correct ? 1 : 0)
               << ',' << (halo_correct ? 1 : 0) << ','
               << (halo_splitk_correct ? 1 : 0) << '\n';
@@ -400,10 +425,12 @@ int run(const Options &options) {
     show("generic", true, generic_ms);
     show("strip", strip_eligible, strip_ms);
     show("halo", halo_eligible, halo_ms);
+    if (halo_stage_k) std::cout << "(k" << halo_stage_k << ") ";
     std::cout << "splitk";
     if (halo_splitk_ms >= 0)
-      std::cout << "x" << halo_splitk_splits << ' ' << std::fixed
-                << std::setprecision(4) << halo_splitk_ms << " ms, ";
+      std::cout << "x" << halo_splitk_splits << "(k" << halo_splitk_stage_k
+                << ") " << std::fixed << std::setprecision(4)
+                << halo_splitk_ms << " ms, ";
     else std::cout << " ineligible, ";
     std::cout << "winner " << winner << '\n';
   }
