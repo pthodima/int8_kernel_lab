@@ -136,8 +136,13 @@ shape, because they answer different questions:
   per-channel scale, then an `int8` output -- the production requantized path.
   One output byte per element.
 
-The gap between the two columns is what the INT32 contract costs, and it is
-strongly shape dependent: with a deep reduction the kernel is bound by the
+Each is reported twice: `cudnn_*_over_dispatch` against `best_ms`, an oracle
+over every candidate, and `cudnn_*_over_policy` against what the compile-time
+policy actually selects.  The policy ratio is the shippable one -- the oracle
+had to build and time four candidates to find its answer.
+
+The gap between the two cuDNN columns is what the INT32 contract costs, and it
+is strongly shape dependent: with a deep reduction the kernel is bound by the
 tensor pipe and the contract is worth a few percent, while with a shallow one
 (`1x1` layers) it is bound by the output write and the contract is worth close
 to 2x.  Treat `cudnn_int8_over_dispatch` as a measure of that contract, not of

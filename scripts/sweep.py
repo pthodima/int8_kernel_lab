@@ -48,7 +48,11 @@ def main() -> None:
             cudnn = subprocess.run(["./build/cudnn_lab"], cwd=root, check=True,
                                    text=True, capture_output=True)
             cudnn_row = next(csv.DictReader(cudnn.stdout.splitlines()))
+            # best_ms is an oracle over the candidates; policy_ms is what the
+            # compile-time policy actually selects, so it is the shippable
+            # number and the one the cuDNN ratios are taken against.
             dispatch_ms = float(measurement["best_ms"])
+            policy_ms = float(measurement["policy_ms"])
             measurement["dispatch_ms"] = dispatch_ms
             for label in ("f32", "int8"):
                 ms = float(cudnn_row[f"cudnn_{label}_ms"])
@@ -56,6 +60,8 @@ def main() -> None:
                 measurement[f"cudnn_{label}_ms"] = ms if ok else ""
                 measurement[f"cudnn_{label}_over_dispatch"] = (
                     ms / dispatch_ms if ok and dispatch_ms > 0 else "")
+                measurement[f"cudnn_{label}_over_policy"] = (
+                    ms / policy_ms if ok and policy_ms > 0 else "")
             # f32 matches the lab's four output bytes per element, so it is the
             # like-for-like number; int8 writes one byte and measures what the
             # INT32 contract costs rather than kernel quality.
