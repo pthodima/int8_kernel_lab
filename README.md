@@ -15,15 +15,13 @@ to measure a dispatch policy, not to replace a production convolution library.
 
 Three kernel families have the same input/output contract:
 
-- `generic`: staged implicit GEMM.  It covers all listed shapes with channel
-  counts divisible by 16.  Its tile is fixed at `64 x 64 x 32` with `64 x 16`
-  warp tiles: `GenericTile` templates only `StageK`, both launchers instantiate
-  the default, and the kernels hardcode their loop bounds and accumulator
-  extents rather than deriving them from `Tile::`, so the shape is not
-  expressible as a template argument today.  It is the fallback for every shape
-  the specialized candidates decline, and runs at roughly a third of machine
-  peak, so deriving those bounds and sweeping `(cta_m, cta_n, warp_n, stage_k)`
-  the way the halo sweeps `(stage_k, splits)` is the largest remaining lever.
+- `generic`: staged implicit GEMM, covering every shape with `C % 16 == 0` and
+  the fallback for anything the specialized candidates decline.  Its CTA tile,
+  warp tile and staging depth are template parameters
+  (`GenericTile<CtaM, CtaN, WarpM, WarpN, StageK>`, overridable with
+  `INT8_LAB_GENERIC_*`), and the kernels derive their fragment counts, loop
+  bounds and accumulator extents from them.  294 combinations were checked
+  exhaustively against the CPU oracle on two shapes and both MMA families.
 - `spatial_strip`: a `128 x 64 x 64` specialization.  It stages one
   horizontally contiguous `130 x 64` input strip and reuses it across the three
   filter columns of a 3x3, horizontal-stride-one convolution.
@@ -156,6 +154,60 @@ architectures.  On sm_120 it fell back to a scalar
 `cnn::conv2d_grouped_direct_kernel`, ~1.34 ms of GPU time for a 14x14 layer and
 the same figure for every shape -- roughly 100x off a real IMMA kernel, which
 made any ratio measured against it meaningless.
+
+## Measuring shared-memory conflicts
+
+`l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st` counts excess
+wavefronts, not bank conflicts specifically.  A staging store whose value comes
+from a global load that has not yet returned is replayed into the same counter,
+so these kernels report an apparent 0-19% conflict rate that tracks warp count
+and disappears entirely when the same store addresses are fed a constant.
+Padding the layout does not move it, a linear layout does not move it, and it
+is not reproducible between runs.
+
+To ask whether a shared-memory layout is actually conflicting, isolate the
+access pattern in a kernel that stages from registers rather than from global
+memory.  Done that way, both swizzles in this repo report zero.
+
+## Dispatch policy
+
+`dispatch_policy.cuh` turns a `ConvShape` into an algorithm and its tile
+parameters:
+
+```cpp
+constexpr DispatchDecision choice = select_conv_kernel<Shape>();
+launch_by_policy<Shape>(input, filter, bias, output);
+```
+
+It is a pure `constexpr` function of the shape, so CGIR can evaluate it at
+code-generation time, and `launch_by_policy` instantiates only the chosen
+kernel -- a policy build costs one template where the candidate search compiles
+eleven.  Every branch re-checks the capability predicate the kernel itself
+asserts, so a mis-classified shape falls back to `generic` rather than failing
+to compile.  `--strategy policy` runs it; `--strategy both` runs it alongside
+the candidates and records its regret.
+
+Each threshold is fitted to a measurement, named in the comment beside it:
+
+- `1x1` convolutions take `generic`.  One tap means no activation to reuse, so
+  the halo degenerates to generic plus bookkeeping, and it lost on every
+  pointwise shape.
+- `spatial_strip` is never selected.  It won 0 of 41 workloads once the halo
+  existed, losing even `big_3x3_s1`, the only shape its `out_w % 128` clause
+  admits.  It is retained because its predicate documents the 1D reuse.
+- Halo `stage_k` is 64 when the staged slab fits 24 KB and 32 otherwise -- the
+  footprint that still admits four CTAs per SM, not a rule about stride.
+- Split-K fires when the grid cannot fill the machine and the reduction has at
+  least two channel groups, with `splits` sized to reach two CTAs per SM.
+- The generic tile is the largest shortlisted tile that still fills the
+  machine, never wider in N than `gemm_n`, and the smallest tile when the
+  reduction is shallow or N is narrow.
+
+`INT8_LAB_TARGET_SMS` (default 36) is the one machine parameter; it enters only
+through the CTA-count tests.  The thresholds were fitted on `workloads.csv` and
+measured on the same set, so treat the regret figures as training-set numbers.
+They are mechanistic -- shared-memory footprint, CTA counts, reduction depth --
+rather than curve fits, but re-measure on a new target.
 
 ## Dispatch policy workflow
 

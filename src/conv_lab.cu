@@ -1,3 +1,4 @@
+#include "dispatch_policy.cuh"
 #include "generic_implicit_gemm.cuh"
 #include "spatial_halo.cuh"
 #include "spatial_strip.cuh"
@@ -239,7 +240,7 @@ Options parse_options(int argc, char **argv) {
   }
   if ((options.strategy != "generic" && options.strategy != "strip" &&
        options.strategy != "halo" && options.strategy != "splitk" &&
-       options.strategy != "both") ||
+       options.strategy != "policy" && options.strategy != "both") ||
       options.warmup < 0 || options.iterations <= 0) {
     std::cerr << "invalid benchmark options\n";
     std::exit(EXIT_FAILURE);
@@ -378,6 +379,20 @@ int run(const Options &options) {
   try_stage(std::integral_constant<int, 64>{});
   try_stage(std::integral_constant<int, 32>{});
 
+  // The policy is evaluated as one more candidate so the sweep records its
+  // regret: how much slower its single compile-time choice is than the best
+  // any candidate achieved.  A policy is only worth shipping if that stays
+  // near 1.00x.
+  constexpr DispatchDecision kPolicy = select_conv_kernel<Shape>();
+  float policy_ms = -1.0f;
+  bool policy_correct = true;
+  if (options.strategy == "policy" || options.strategy == "both") {
+    evaluate([&] {
+      launch_by_policy<Shape>(d_input.get(), d_filter.get(), d_bias.get(),
+                              d_output.get());
+    }, "policy", policy_ms, policy_correct);
+  }
+
   const char *winner = "none";
   float best = -1.0f;
   if (generic_ms >= 0) { winner = "generic"; best = generic_ms; }
@@ -394,8 +409,9 @@ int run(const Options &options) {
                  "dilation_w,out_h,out_w,gemm_m,gemm_n,gemm_k,eligible_strip,"
                  "eligible_halo,eligible_splitk,generic_ms,strip_ms,halo_ms,"
                  "halo_stage_k,halo_splitk_ms,halo_splits,halo_splitk_stage_k,"
-                 "winner,best_ms,generic_correct,strip_correct,halo_correct,"
-                 "halo_splitk_correct\n";
+                 "winner,best_ms,policy_algorithm,policy_config,policy_ms,"
+                 "policy_regret,generic_correct,strip_correct,halo_correct,"
+                 "halo_splitk_correct,policy_correct\n";
     std::cout << kCaseName << ',' << Shape::n << ',' << Shape::h << ','
               << Shape::w << ',' << Shape::c << ',' << Shape::k << ','
               << Shape::r << ',' << Shape::s << ',' << Shape::pad_h << ','
@@ -409,9 +425,19 @@ int run(const Options &options) {
               << strip_ms << ',' << halo_ms << ',' << halo_stage_k << ','
               << halo_splitk_ms << ',' << halo_splitk_splits << ','
               << halo_splitk_stage_k << ',' << winner << ',' << best << ','
+              << algorithm_name(kPolicy.algorithm) << ',';
+    if (kPolicy.algorithm == ConvAlgorithm::kGeneric)
+      std::cout << kPolicy.cta_m << 'x' << kPolicy.cta_n << '/' << kPolicy.warp_m
+                << 'x' << kPolicy.warp_n << "/k" << kPolicy.stage_k;
+    else
+      std::cout << kPolicy.halo_tile_h << 'x' << kPolicy.halo_tile_w << "/k"
+                << kPolicy.halo_stage_k << "/s" << kPolicy.halo_splits;
+    std::cout << ',' << policy_ms << ','
+              << (policy_ms > 0 && best > 0 ? policy_ms / best : -1.0f) << ','
               << (generic_correct ? 1 : 0) << ',' << (strip_correct ? 1 : 0)
               << ',' << (halo_correct ? 1 : 0) << ','
-              << (halo_splitk_correct ? 1 : 0) << '\n';
+              << (halo_splitk_correct ? 1 : 0) << ','
+              << (policy_correct ? 1 : 0) << '\n';
   } else {
     auto show = [&](const char *label, bool eligible, float milliseconds) {
       std::cout << label << ' ';
@@ -432,10 +458,17 @@ int run(const Options &options) {
                 << ") " << std::fixed << std::setprecision(4)
                 << halo_splitk_ms << " ms, ";
     else std::cout << " ineligible, ";
-    std::cout << "winner " << winner << '\n';
+    std::cout << "winner " << winner << ", policy "
+              << algorithm_name(kPolicy.algorithm) << ' ';
+    if (policy_ms >= 0)
+      std::cout << std::fixed << std::setprecision(4) << policy_ms << " ms ("
+                << (best > 0 ? policy_ms / best : 0) << "x best)";
+    else std::cout << "not run";
+    std::cout << '\n';
   }
   return generic_correct && strip_correct && halo_correct &&
-                 halo_splitk_correct && std::string(winner) != "none"
+                 halo_splitk_correct && policy_correct &&
+                 std::string(winner) != "none"
              ? 0
              : 1;
 }
