@@ -17,20 +17,45 @@
 //
 // For 3x3/stride1 with a 4x32 patch that is 6x34 = 204 staged pixels per 128
 // outputs per 9 taps, against the strip's 3 * 130 = 390.
-template <int TileH, int TileW, int StageK = 64>
+// CtaN widens the output-channel tile.  The A slab does not depend on it, so
+// doubling it costs only the B slab (about +10% of shared memory at stride 2)
+// while doubling the MMA issued per A-stage.  It is not a better default: it
+// also halves the CTA count, which loses badly on shapes that are already
+// CTA-starved -- measured 1.23x on big_3x3_s2 but 0.69x on resnet_s3_3x3, with
+// 12 of 35 eligible workloads regressing.  It belongs in the dispatch search.
+//
+// Both MMA families keep a 64(M) x 32(N) warp tile; CtaN only changes how many
+// warps tile N, so cta_n = 64 reproduces the previous kernel exactly.
+template <int TileH, int TileW, int StageK = 64, int CtaN = 64>
 struct HaloTile {
   static constexpr int tile_h = TileH;
   static constexpr int tile_w = TileW;
   static constexpr int cta_m = TileH * TileW;
-  static constexpr int cta_n = 64;
+  static constexpr int cta_n = CtaN;
+  static constexpr int warp_m = 64;
+  static constexpr int warp_n = 32;
+  static constexpr int warps_m = cta_m / warp_m;
+  static constexpr int warps_n = CtaN / warp_n;
+  // The sm75 fragment mapping tiles N in 64-wide blocks, four warps each.
+  static constexpr int warps_n64 = CtaN / 64;
   // Channels staged per pass.  Halving this halves the staged slab, which is
   // what binds occupancy once the halo grows: at stride 2 a 4x32 patch needs
   // 9x65 pixels and 41 KB at StageK=64, holding the kernel to 2 CTAs/SM.
   static constexpr int stage_k = StageK;
   static_assert(StageK == 32 || StageK == 64 || StageK == 128,
                 "stage_k must be 32, 64 or 128");
-  static constexpr int threads = 128;
+  static constexpr int warps = warps_m * warps_n;
+  static constexpr int threads = warps * 32;
+  // The occupancy hint targets a constant number of warps per SM, not CTAs:
+  // asking for four 256-thread CTAs would cap ptxas at 64 registers and spill
+  // the 64 accumulators.  At 128 threads this is the previous constant.
+  static constexpr int min_ctas =
+      INT8_LAB_MIN_CTAS_PER_SM * 128 / threads > 0
+          ? INT8_LAB_MIN_CTAS_PER_SM * 128 / threads
+          : 1;
   static_assert(cta_m == 128, "fragment and epilogue mapping assume 128 rows");
+  static_assert(CtaN % 64 == 0, "cta_n must be a whole number of 64-wide blocks");
+  static_assert(threads <= 1024, "at most 32 warps per CTA");
   static_assert(TileW % 16 == 0,
                 "a 16-row MMA fragment must stay inside one patch row");
 };
@@ -47,8 +72,12 @@ struct HaloTile {
 #ifndef INT8_LAB_HALO_STAGE_K
 #define INT8_LAB_HALO_STAGE_K 64
 #endif
+#ifndef INT8_LAB_HALO_CTA_N
+#define INT8_LAB_HALO_CTA_N 64
+#endif
 using DefaultHaloTile =
-    HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, INT8_LAB_HALO_STAGE_K>;
+    HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, INT8_LAB_HALO_STAGE_K,
+             INT8_LAB_HALO_CTA_N>;
 
 template <class Shape, class Tile = DefaultHaloTile>
 struct HaloLayout {
@@ -183,7 +212,7 @@ __device__ __forceinline__ int halo_a_offset(int m_local, int filter_y,
 
 #if INT8_LAB_MMA_SM80
 template <class Shape, class Tile = DefaultHaloTile, int Splits = 1>
-__global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spatial_halo_sm80_kernel(
+__global__ __launch_bounds__(Tile::threads, Tile::min_ctas) void spatial_halo_sm80_kernel(
     const int8_t *__restrict__ input, const int8_t *__restrict__ filter,
     const int32_t *__restrict__ bias, int32_t *__restrict__ output) {
   using L = HaloLayout<Shape, Tile>;
@@ -211,9 +240,12 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
 
   const int in_y0 = tile_oy * Shape::stride_h - Shape::pad_h;
   const int in_x0 = tile_ox * Shape::stride_w - Shape::pad_w;
-  const int warp_m = (warp >> 1) * 64, warp_n = (warp & 1) * 32;
+  const int warp_m = (warp / Tile::warps_n) * Tile::warp_m;
+  const int warp_n = (warp % Tile::warps_n) * Tile::warp_n;
   constexpr int taps = Shape::r * Shape::s;
-  int32_t acc[4][4][4] = {};
+  constexpr int kAccM = Tile::warp_m / 16;
+  constexpr int kAccN = Tile::warp_n / 8;
+  int32_t acc[kAccM][kAccN][4] = {};
 
 #pragma unroll 1
   for (int cg = cg_begin; cg < cg_end; ++cg) {
@@ -233,9 +265,9 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
       }
 #pragma unroll
       for (int k = 0; k < Tile::stage_k; k += 32) {
-        uint32_t a[4][4], b[4][2];
+        uint32_t a[kAccM][4], b[kAccN][2];
 #pragma unroll
-        for (int m = 0; m < 4; ++m) {
+        for (int m = 0; m < kAccM; ++m) {
           load_matrix_x4(
               shared_a + halo_swizzle<Tile::stage_k>(halo_a_offset<Shape, Tile>(
                              warp_m + m * 16 + lane % 16, filter_y, filter_x,
@@ -243,16 +275,16 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
               a[m][0], a[m][1], a[m][2], a[m][3]);
         }
 #pragma unroll
-        for (int n = 0; n < 4; ++n) {
+        for (int n = 0; n < kAccN; ++n) {
           load_matrix_x2(shared_b + halo_swizzle<Tile::stage_k>(
                              (warp_n + n * 8 + lane % 8) * Tile::stage_k + k +
                              ((lane / 8) % 2) * 16),
                          b[n][0], b[n][1]);
         }
 #pragma unroll
-        for (int m = 0; m < 4; ++m)
+        for (int m = 0; m < kAccM; ++m)
 #pragma unroll
-          for (int n = 0; n < 4; ++n)
+          for (int n = 0; n < kAccN; ++n)
             mma_m16n8k32(acc[m][n][0], acc[m][n][1], acc[m][n][2], acc[m][n][3],
                          a[m][0], a[m][1], a[m][2], a[m][3], b[n][0], b[n][1]);
       }
@@ -265,9 +297,9 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
   }
 
 #pragma unroll
-  for (int m = 0; m < 4; ++m)
+  for (int m = 0; m < kAccM; ++m)
 #pragma unroll
-    for (int n = 0; n < 4; ++n) {
+    for (int n = 0; n < kAccN; ++n) {
       const int col = n_base + warp_n + n * 8 + (lane & 3) * 2;
 #pragma unroll
       for (int half = 0; half < 2; ++half) {
@@ -295,7 +327,7 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
 }
 #else
 template <class Shape, class Tile = DefaultHaloTile, int Splits = 1>
-__global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spatial_halo_sm75_kernel(
+__global__ __launch_bounds__(Tile::threads, Tile::min_ctas) void spatial_halo_sm75_kernel(
     const int8_t *__restrict__ input, const int8_t *__restrict__ filter,
     const int32_t *__restrict__ bias, int32_t *__restrict__ output) {
   using L = HaloLayout<Shape, Tile>;
@@ -323,7 +355,11 @@ __global__ __launch_bounds__(Tile::threads, INT8_LAB_MIN_CTAS_PER_SM) void spati
 
   const int in_y0 = tile_oy * Shape::stride_h - Shape::pad_h;
   const int in_x0 = tile_ox * Shape::stride_w - Shape::pad_w;
-  const int warp_m_group = (warp >> 1) << 3, warp_n_group = (warp & 1) << 3;
+  // Warp w: bit0 picks the N half of a 64-wide block, bit1 the M half,
+  // the rest which 64-wide N block.  At cta_n = 64 this is (warp>>1)<<3
+  // and (warp&1)<<3, i.e. the previous mapping.
+  const int warp_m_group = ((warp >> 1) & 1) << 3;
+  const int warp_n_group = ((warp & 1) << 3) + (warp >> 2) * 64;
   constexpr int taps = Shape::r * Shape::s;
   int32_t acc[8][4][2] = {};
 

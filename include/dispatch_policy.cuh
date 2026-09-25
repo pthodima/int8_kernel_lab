@@ -20,11 +20,31 @@
 
 #include <cuda_runtime.h>
 
-// The machine width the policy targets.  It only enters through "are there
-// enough CTAs to fill the GPU", so it wants the SM count of the deployment
-// target, not of the build host.
+// ---------------------------------------------------------------------------
+// Machine description.  Every threshold below is derived from these four
+// numbers rather than being a tuned constant, so retargeting is a matter of
+// passing the right -D flags.  `scripts/target_flags.py` queries a device and
+// prints them.  The defaults describe the RTX 5060 Ti (sm_120) this repo was
+// measured on; the commented values are an RTX 2080 Ti (sm_75) for contrast.
+//
+// Only INT8_LAB_TARGET_SMS affects whether the grid fills the machine; the
+// other three set how much of an SM one CTA may claim.
 #ifndef INT8_LAB_TARGET_SMS
-#define INT8_LAB_TARGET_SMS 36
+#define INT8_LAB_TARGET_SMS 36            // 2080 Ti: 68
+#endif
+#ifndef INT8_LAB_TARGET_SHARED_PER_SM
+#define INT8_LAB_TARGET_SHARED_PER_SM (100 * 1024)   // 2080 Ti: 64 * 1024
+#endif
+// How many CTAs of the baseline 128-thread shape should fit on one SM.  It is
+// the occupancy the kernels are tuned for, and it sets both the shared-memory
+// budget per CTA and the ptxas register hint.
+#ifndef INT8_LAB_TARGET_CTAS_PER_SM
+#define INT8_LAB_TARGET_CTAS_PER_SM 4     // m8n8k16 spills at 4; use 3
+#endif
+// Waves of CTAs wanted before the grid counts as filling the machine.  Below
+// this, split-K is worth its zeroing pass and atomics.
+#ifndef INT8_LAB_TARGET_WAVES
+#define INT8_LAB_TARGET_WAVES 2
 #endif
 
 enum class ConvAlgorithm {
@@ -40,6 +60,7 @@ struct DispatchDecision {
   int halo_tile_w = 32;
   int halo_stage_k = 64;
   int halo_splits = 1;
+  int halo_cta_n = 64;
   int cta_m = 64;
   int cta_n = 64;
   int warp_m = 32;
@@ -58,7 +79,9 @@ constexpr int policy_round_up_pow2(int v) {
 template <class Shape>
 constexpr DispatchDecision select_conv_kernel() {
   DispatchDecision d{};
-  constexpr int kTargetCtas = 2 * INT8_LAB_TARGET_SMS;
+  constexpr int kTargetCtas = INT8_LAB_TARGET_WAVES * INT8_LAB_TARGET_SMS;
+  // The driver instantiates split counts up to this; keep them in step.
+  constexpr int kMaxSplits = 16;
 
   // ---- generic tile, which is also the fallback -------------------------
   // Sweeping 294 tiles over five shapes: every tile in the top eight used
@@ -115,8 +138,21 @@ constexpr DispatchDecision select_conv_kernel() {
   // its eligibility predicate documents the 1D form of the reuse, but it won
   // 0 of 41 workloads once the halo existed, losing even big_3x3_s1, the only
   // shape its out_w % 128 clause admits.
-  using Halo64 = HaloTile<4, 32, 64>;
-  using Halo32 = HaloTile<4, 32, 32>;
+  // ---- cta_n: wider N amortises the A slab, at the cost of half the CTAs ----
+  // The A slab does not depend on cta_n, so doubling it buys 2x the MMA per
+  // A-stage for about 10% more shared memory -- but it also halves the grid.
+  // Measured over workloads.csv, that trade splits exactly on stride: every
+  // stride>1 shape gains (big_3x3_s2 1.22x, resnet_s4_down 1.14x,
+  // resnet_s5_down 1.11x, big_5x5_s2 1.06x) and every stride-1 3x3 loses
+  // (darknet_res_52_expand 0.81x, dilated_3x3 0.82x, batch8_3x3 0.84x).  At
+  // stride 1 the slab is small, so there is little to amortise and the lost
+  // CTAs dominate.
+  constexpr bool kWide =
+      (Shape::stride_h > 1 || Shape::stride_w > 1) && Shape::k % 128 == 0;
+  constexpr int kCtaN = kWide ? 128 : 64;
+  d.halo_cta_n = kCtaN;
+  using Halo64 = HaloTile<4, 32, 64, kCtaN>;
+  using Halo32 = HaloTile<4, 32, 32, kCtaN>;
   constexpr bool halo64 = kSpatialHaloEligible<Shape, Halo64>;
   constexpr bool halo32 = kSpatialHaloEligible<Shape, Halo32>;
   if (!halo64 && !halo32) return d;
@@ -128,9 +164,19 @@ constexpr DispatchDecision select_conv_kernel() {
   // was worth 1.55x on big_3x3_s2 and made big_5x5_s2 eligible at all, while
   // costing 10% on big_3x3_s1 where the patch is already compact.  The
   // threshold is the footprint that still admits four CTAs per SM.
-  constexpr int kFootprintForFourCtas = 24 * 1024;
+  // The threshold is a warps-per-SM target, not a CTA count: a cta_n=128 tile
+  // runs 256-thread CTAs, so two of them occupy the same sixteen warps that
+  // four 128-thread CTAs do, and it may spend twice the shared memory to get
+  // there.  Scaling by cta_n/64 is what lets big_3x3_s2 keep stage_k 64 at
+  // cta_n 128 (4.92 ms) instead of dropping to 32 (5.33 ms).
+  // Shared memory one CTA may claim and still hit the occupancy target.  The
+  // cta_n/64 factor is the residency correction: a cta_n=128 tile runs
+  // 256-thread CTAs, so half as many fit and each may spend twice as much.
+  constexpr int kFootprintBudget =
+      (INT8_LAB_TARGET_SHARED_PER_SM / INT8_LAB_TARGET_CTAS_PER_SM) *
+      (kCtaN / 64);
   const bool compact =
-      halo64 && HaloLayout<Shape, Halo64>::shared_bytes <= kFootprintForFourCtas;
+      halo64 && HaloLayout<Shape, Halo64>::shared_bytes <= kFootprintBudget;
   d.halo_stage_k = (compact || !halo32) ? 64 : 32;
   const int stage_k = d.halo_stage_k;
 
@@ -143,12 +189,20 @@ constexpr DispatchDecision select_conv_kernel() {
   // why big_1x1_s1 and big_3x3_s1 regress 4x under it.
   const int tiles_x = policy_ceil_div(Shape::out_w, d.halo_tile_w);
   const int tiles_y = policy_ceil_div(Shape::out_h, d.halo_tile_h);
-  const int ctas = Shape::n * tiles_y * tiles_x * (Shape::k / 64);
+  const int ctas = Shape::n * tiles_y * tiles_x * (Shape::k / kCtaN);
   const int channel_groups = Shape::c / stage_k;
-  if (ctas < kTargetCtas && channel_groups >= 2) {
-    int splits = policy_round_up_pow2(policy_ceil_div(kTargetCtas, ctas));
+  // The target scales with cta_n for the same reason the footprint budget
+  // does.  kTargetCtas was calibrated against 128-thread CTAs, four resident
+  // per SM; a cta_n=128 tile runs 256-thread CTAs, only two fit, and each does
+  // twice the work, so the machine is filled by half as many.  Comparing the
+  // smaller grid against the unscaled target over-splits: darknet_down_52 took
+  // eight ways where two suffice (29.7 -> 33.8 us) and resnet_s5_down sixteen
+  // where the oracle wants eight.
+  const int target = kTargetCtas * 64 / kCtaN;
+  if (ctas < target && channel_groups >= 2) {
+    int splits = policy_round_up_pow2(policy_ceil_div(target, ctas));
     if (splits > channel_groups) splits = channel_groups;
-    if (splits > 16) splits = 16;
+    if (splits > kMaxSplits) splits = kMaxSplits;
     if (splits >= 2) {
       d.algorithm = ConvAlgorithm::kSpatialHaloSplitK;
       d.halo_splits = splits;
@@ -168,7 +222,7 @@ void launch_by_policy(const int8_t *input, const int8_t *filter,
                       cudaStream_t stream = 0) {
   constexpr DispatchDecision kChoice = select_conv_kernel<Shape>();
   using HTile = HaloTile<kChoice.halo_tile_h, kChoice.halo_tile_w,
-                         kChoice.halo_stage_k>;
+                         kChoice.halo_stage_k, kChoice.halo_cta_n>;
   using GTile = GenericTile<kChoice.cta_m, kChoice.cta_n, kChoice.warp_m,
                             kChoice.warp_n, kChoice.stage_k>;
   if constexpr (kChoice.algorithm == ConvAlgorithm::kSpatialHaloSplitK) {

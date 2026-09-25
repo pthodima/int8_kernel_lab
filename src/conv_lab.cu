@@ -304,8 +304,10 @@ int run(const Options &options) {
   // at stage_k 64 against 21 KB and 4 at 32.  Measured on big_3x3_s2, halving
   // it is worth 1.55x; on big_3x3_s1 it costs 10%.  So both are candidates and
   // the dispatch table records which one won.
-  using HaloTile64 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 64>;
-  using HaloTile32 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 32>;
+  using HaloTile64 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 64,
+                              INT8_LAB_HALO_CTA_N>;
+  using HaloTile32 = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, 32,
+                              INT8_LAB_HALO_CTA_N>;
   const bool halo_eligible =
       kSpatialHaloEligible<Shape, HaloTile64> || kSpatialHaloEligible<Shape, HaloTile32>;
   const bool splitk_eligible =
@@ -313,7 +315,7 @@ int run(const Options &options) {
       (kSpatialHaloEligible<Shape, HaloTile32> && kSplitKUsable<Shape, HaloTile32, 2>);
   float generic_ms = -1.0f, strip_ms = -1.0f, halo_ms = -1.0f;
   bool generic_correct = true, strip_correct = true, halo_correct = true;
-  int halo_stage_k = 0;
+  int halo_stage_k = 0, halo_cta_n = 0;
   float halo_splitk_ms = -1.0f;
   int halo_splitk_splits = 0, halo_splitk_stage_k = 0;
   bool halo_splitk_correct = true;
@@ -333,10 +335,12 @@ int run(const Options &options) {
   // Split-K stays a separate candidate rather than a mode of the halo, because
   // it trades a zeroing pass plus atomics for CTA count: a dispatch policy has
   // to see both numbers and the configuration that produced each.
-  auto try_halo = [&](auto stage_tag, auto split_tag) {
+  auto try_halo = [&](auto stage_tag, auto split_tag, auto ctan_tag) {
     constexpr int kStageK = decltype(stage_tag)::value;
     constexpr int kSplits = decltype(split_tag)::value;
-    using Tile = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, kStageK>;
+    constexpr int kCtaN = decltype(ctan_tag)::value;
+    using Tile = HaloTile<INT8_LAB_HALO_TILE_H, INT8_LAB_HALO_TILE_W, kStageK,
+                          kCtaN>;
     if constexpr (kSpatialHaloEligible<Shape, Tile> &&
                   kSplitKUsable<Shape, Tile, kSplits>) {
       const bool wanted = kSplits == 1
@@ -357,6 +361,7 @@ int run(const Options &options) {
           if (ms >= 0 && (halo_ms < 0 || ms < halo_ms)) {
             halo_ms = ms;
             halo_stage_k = kStageK;
+            halo_cta_n = kCtaN;
           }
         } else {
           if (!ok) halo_splitk_correct = false;
@@ -369,15 +374,19 @@ int run(const Options &options) {
       }
     }
   };
-  auto try_stage = [&](auto stage_tag) {
-    try_halo(stage_tag, std::integral_constant<int, 1>{});
-    try_halo(stage_tag, std::integral_constant<int, 2>{});
-    try_halo(stage_tag, std::integral_constant<int, 4>{});
-    try_halo(stage_tag, std::integral_constant<int, 8>{});
-    try_halo(stage_tag, std::integral_constant<int, 16>{});
+  auto try_stage = [&](auto stage_tag, auto ctan_tag) {
+    try_halo(stage_tag, std::integral_constant<int, 1>{}, ctan_tag);
+    try_halo(stage_tag, std::integral_constant<int, 2>{}, ctan_tag);
+    try_halo(stage_tag, std::integral_constant<int, 4>{}, ctan_tag);
+    try_halo(stage_tag, std::integral_constant<int, 8>{}, ctan_tag);
+    try_halo(stage_tag, std::integral_constant<int, 16>{}, ctan_tag);
   };
-  try_stage(std::integral_constant<int, 64>{});
-  try_stage(std::integral_constant<int, 32>{});
+  auto try_ctan = [&](auto ctan_tag) {
+    try_stage(std::integral_constant<int, 64>{}, ctan_tag);
+    try_stage(std::integral_constant<int, 32>{}, ctan_tag);
+  };
+  try_ctan(std::integral_constant<int, 64>{});
+  try_ctan(std::integral_constant<int, 128>{});
 
   // The policy is evaluated as one more candidate so the sweep records its
   // regret: how much slower its single compile-time choice is than the best
@@ -408,7 +417,7 @@ int run(const Options &options) {
     std::cout << "case,n,h,w,c,k,r,s,pad_h,pad_w,stride_h,stride_w,dilation_h,"
                  "dilation_w,out_h,out_w,gemm_m,gemm_n,gemm_k,eligible_strip,"
                  "eligible_halo,eligible_splitk,generic_ms,strip_ms,halo_ms,"
-                 "halo_stage_k,halo_splitk_ms,halo_splits,halo_splitk_stage_k,"
+                 "halo_stage_k,halo_cta_n,halo_splitk_ms,halo_splits,halo_splitk_stage_k,"
                  "winner,best_ms,policy_algorithm,policy_config,policy_ms,"
                  "policy_regret,generic_correct,strip_correct,halo_correct,"
                  "halo_splitk_correct,policy_correct\n";
@@ -422,7 +431,7 @@ int run(const Options &options) {
               << ',' << Shape::gemm_k << ',' << (strip_eligible ? 1 : 0) << ','
               << (halo_eligible ? 1 : 0) << ',' << (splitk_eligible ? 1 : 0)
               << ',' << generic_ms << ','
-              << strip_ms << ',' << halo_ms << ',' << halo_stage_k << ','
+              << strip_ms << ',' << halo_ms << ',' << halo_stage_k << ',' << halo_cta_n << ','
               << halo_splitk_ms << ',' << halo_splitk_splits << ','
               << halo_splitk_stage_k << ',' << winner << ',' << best << ','
               << algorithm_name(kPolicy.algorithm) << ',';

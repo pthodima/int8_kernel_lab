@@ -37,6 +37,12 @@ Three kernel families have the same input/output contract:
   less activation traffic than the strip and drops the strip's `out_w` divisor
   requirement -- output edges are predicated instead.  The patch aspect ratio
   is a compile-time knob (`INT8_LAB_HALO_TILE_H`/`_W`, default `4 x 32`).
+  The output-channel tile (`cta_n`, `INT8_LAB_HALO_CTA_N`) is searched over 64
+  and 128.  The A slab does not depend on it, so doubling it buys twice the MMA
+  per A-stage for about 10% more shared memory -- but it also halves the grid,
+  and that trade splits exactly on stride: every stride>1 shape gains
+  (`big_3x3_s2` 1.22x, `resnet_s4_down` 1.14x) and every stride-1 3x3 loses
+  (`darknet_res_52_expand` 0.81x, `dilated_3x3` 0.82x).
   Channels staged per pass (`stage_k`) is searched at run time over 64 and 32,
   because it is not a global default: 64 wins when the patch is compact, but
   stride or a large filter inflates the halo until the staged slab, not the
@@ -85,10 +91,11 @@ Use `--strategy generic`, `--strategy strip`, `--strategy halo`, or
 eligible one.  The CSV carries one eligibility flag and one timing column per
 candidate (`eligible_strip`, `eligible_halo`, `eligible_splitk`, `generic_ms`,
 `strip_ms`, `halo_ms`, `halo_splitk_ms`), the configuration that produced each
-halo number (`halo_stage_k`, `halo_splits`, `halo_splitk_stage_k`), and
-`winner`/`best_ms`.  The halo and split-K candidates search ten configurations
-per shape -- two `stage_k` values by five split counts -- so a build covers the
-whole space and the CSV records which point won.  `--coverage` prints what
+halo number (`halo_stage_k`, `halo_cta_n`, `halo_splits`,
+`halo_splitk_stage_k`), and `winner`/`best_ms`.  The halo and split-K
+candidates search twenty configurations per shape -- two `cta_n` by two
+`stage_k` by five split counts -- so a build covers the whole space and the CSV
+records which point won.  `--coverage` prints what
 fraction of output channels, `ox`, and `oy` the correctness sampler reaches.
 
 The oracle check is exhaustive below 65536 outputs.  Above that it walks a
@@ -160,6 +167,29 @@ architectures.  On sm_120 it fell back to a scalar
 the same figure for every shape -- roughly 100x off a real IMMA kernel, which
 made any ratio measured against it meaningless.
 
+## Why the stride-2 shapes still trail cuDNN
+
+cuDNN's winning kernel there is a `64x128x64` tile with three staged shared
+buffers, and it fills them with `cp.async`: `smsp__inst_executed_op_ldgsts` is
+14.9M, all of it the cache-bypass (`.cg`) variant, while
+`smsp__inst_executed_op_global_ld` is zero -- it issues no plain global load at
+all.  Asynchronous copy stages global to shared with no register live range, so
+its third buffer costs 12 KB of shared memory and nothing else.
+
+Hand-written pipelining cannot reproduce that, and both attempts are recorded
+in the history.  Two register-staged buffers took the long-scoreboard stall
+from 44.9% to 14.4%, close to cuDNN's 11.1%, and still lost, because the extra
+slab halved occupancy.  Three buffers lose further: the stride-2 halo is 18.7 KB
+per stage, so three of them plus B leave one CTA per SM and every per-tap
+barrier drains the whole SM's tensor pipe.  Without asynchronous copies the
+latency cover is bounded by the register ring, not by the number of shared
+buffers, so the extra buffers buy nothing for their footprint.
+
+CGIR cannot emit `cp.async`, so this gap is a capability question rather than a
+tuning one.  Note also that checking one `ldgsts` counter does not establish
+whether a kernel uses asynchronous copy: the `.ca` and `.cg` variants have
+separate counters and a kernel using one reads zero on the other.
+
 ## Measuring shared-memory conflicts
 
 `l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st` counts excess
@@ -207,12 +237,44 @@ Each threshold is fitted to a measurement, named in the comment beside it:
 - The generic tile is the largest shortlisted tile that still fills the
   machine, never wider in N than `gemm_n`, and the smallest tile when the
   reduction is shallow or N is narrow.
+- The halo takes `cta_n` 128 at stride greater than one and 64 otherwise.  At
+  stride 1 the A slab is small, so there is little to amortise and the halved
+  CTA count dominates.
 
-`INT8_LAB_TARGET_SMS` (default 36) is the one machine parameter; it enters only
-through the CTA-count tests.  The thresholds were fitted on `workloads.csv` and
-measured on the same set, so treat the regret figures as training-set numbers.
-They are mechanistic -- shared-memory footprint, CTA counts, reduction depth --
-rather than curve fits, but re-measure on a new target.
+### Retargeting
+
+The policy is a compile-time function, so the machine it targets is described
+by macros rather than queried at run time.  Four of them, and every threshold
+is derived from them rather than tuned independently:
+
+| macro | default | meaning |
+| --- | --- | --- |
+| `INT8_LAB_TARGET_SMS` | 36 | SM count; decides whether a grid fills the GPU |
+| `INT8_LAB_TARGET_SHARED_PER_SM` | 100 KB | shared-memory carveout per SM |
+| `INT8_LAB_TARGET_CTAS_PER_SM` | 4 | occupancy the kernels are tuned for |
+| `INT8_LAB_TARGET_WAVES` | 2 | CTA waves before a grid counts as full |
+
+The split-K trigger is `TARGET_WAVES * TARGET_SMS` CTAs and the `stage_k`
+footprint budget is `TARGET_SHARED_PER_SM / TARGET_CTAS_PER_SM`, each corrected
+by `cta_n / 64` because a `cta_n = 128` tile runs 256-thread CTAs: half as many
+are resident, and each may claim twice the shared memory.  Getting that
+correction wrong is what made the first `cta_n` integration over-split and
+regress `darknet_down_52` by 1.20x.
+
+`scripts/target_flags.py` prints the flags for a device:
+
+```bash
+./scripts/target_flags.py --comment                        # this machine
+./scripts/target_flags.py --arch sm_75 --sms 68 --ctas-per-sm 3
+```
+
+Flags are not sufficient on their own.  The generic tile shortlist and the
+`gemm_n <= 32` / `gemm_k <= 128` thresholds were measured on this GPU and need
+re-sweeping on another, not just new macros.  The thresholds were also fitted
+on `workloads.csv` and measured on the same set, so treat the regret figures as
+training-set numbers.  They are mechanistic -- shared-memory footprint, CTA
+counts, reduction depth -- rather than curve fits, but re-measure on a new
+target.
 
 ## Dispatch policy workflow
 

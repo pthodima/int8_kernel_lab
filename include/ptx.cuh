@@ -9,11 +9,17 @@
 // halo 10.10 -> 7.41 ms.  Five spills and costs roughly 2x, so this is a
 // per-architecture tuning knob, not a constant of nature.
 // m8n8k16 needs one more register per accumulator pair and spills at four.
+#ifndef INT8_LAB_TARGET_CTAS_PER_SM
+#define INT8_LAB_TARGET_CTAS_PER_SM 4
+#endif
 #ifndef INT8_LAB_MIN_CTAS_PER_SM
 #if INT8_LAB_MMA_SM80
-#define INT8_LAB_MIN_CTAS_PER_SM 4
+#define INT8_LAB_MIN_CTAS_PER_SM INT8_LAB_TARGET_CTAS_PER_SM
 #else
-#define INT8_LAB_MIN_CTAS_PER_SM 3
+// m8n8k16 needs one more register per accumulator pair and spills a step
+// earlier, so it targets one fewer CTA than the machine description asks for.
+#define INT8_LAB_MIN_CTAS_PER_SM \
+  (INT8_LAB_TARGET_CTAS_PER_SM > 1 ? INT8_LAB_TARGET_CTAS_PER_SM - 1 : 1)
 #endif
 #endif
 
